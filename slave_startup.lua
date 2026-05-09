@@ -1,0 +1,1 @@
+shell.execute("slave.lua")

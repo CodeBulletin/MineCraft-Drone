@@ -56,14 +56,14 @@ while true do
 
     if type(message) == "table"
     and message.type == "setup_request"
-    and message.network == config.network then
+    and message.network == network then
 
         rednet.send(senderId,{
             type = "register",
-            network = config.network,
-            offsetX = config.offsetX,
-            offsetZ = config.offsetZ,
-            spinDir = config.spinDir
+            network = network,
+            offsetX = offsetX,
+            offsetZ = offsetZ,
+            spinDir = spinDir
         },"setup")
 
         print("Registered")

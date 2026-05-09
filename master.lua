@@ -99,9 +99,15 @@ local function angleDiff(target, current)
     return diff
 end
 
-local function deadzone(v, t)
-    if math.abs(v) < t then return 0 end
-    return v
+-- Add a TPA function
+local function getTPA(throttle, base)
+    -- If throttle is lower than base, reduce gains
+    -- This scales gains from 100% at hover to 70% at min throttle
+    if throttle < base then
+        local factor = (throttle - 30) / (base - 30)
+        return math.max(0.7, factor)
+    end
+    return 1.0
 end
 
 --------------------------------------------------
@@ -112,12 +118,12 @@ local pitchPID = createPID(6.0, 0.00, 0.0)
 local rollPID  = createPID(6.0, 0.00, 0.0)
 local yawPID   = createPID(6.0, 0.00, 0.0)
 
-local pitchRatePID = createPID(1.2, 0.02, 0.4)
-local rollRatePID  = createPID(1.2, 0.02, 0.4)
+local pitchRatePID = createPID(1.2, 0.02, 0.6)
+local rollRatePID  = createPID(1.2, 0.02, 0.6)
 local yawRatePID   = createPID(1.2, 0.02, 0.4)
 
 local altPID =  createPID(2.0, 0.0, 0.0)
-local velPID =  createPID(12.0, 1.2, 6.0)
+local velPID =  createPID(12.0, 0.8, 3.0)
 
 local posXPID =  createPID(0.5, 0.0, 0.0)
 local posZPID =  createPID(0.5, 0.0, 0.0)
@@ -265,18 +271,24 @@ local function flightThread()
             end
 
             -- Pitch Roll Velocity Stablization
-            targetAlt = targetAlt + control.th * dt * 8
+            local climbRate = control.th * 3.0 
+            -------------------------------------------------- -- Limit descent speed --------------------------------------------------
+            targetAlt = targetAlt + climbRate * dt
+
             local targetVelRate = updatePID(altPID, targetAlt, alt, dt)
             local targetPitchRate = updatePID(pitchPID, targetPitch, pitch, dt)
             local targetRollRate  = updatePID(rollPID, targetRoll, roll, dt)
 
+            targetVelRate = clamp(targetVelRate, -10.0, 10.0)
+
+            local velCorr = updatePID(velPID, targetVelRate, vy, dt)
+            local throttle = math.max(30, math.min(baseThrottle + velCorr, 250));
+            local tpaFactor = getTPA(throttle, baseThrottle)
+
             -- Error Calculations
             local yawCorr = updatePID(yawRatePID, targetYawRate, yawRate, dt) * yawPower
-            local pitchCorr = updatePID(pitchRatePID, targetPitchRate, pitchRate, dt) * power
-            local rollCorr = updatePID(rollRatePID, targetRollRate, rollRate, dt) * power
-            local velCorr = updatePID(velPID, targetVelRate, vy, dt)
-
-            local throttle = math.max(0, math.min(baseThrottle + velCorr, 250));
+            local pitchCorr = updatePID(pitchRatePID, targetPitchRate, pitchRate, dt) * power * tpaFactor
+            local rollCorr  = updatePID(rollRatePID, targetRollRate, rollRate, dt) * power * tpaFactor       
 
             for _, motor in ipairs(motors) do
                 local speed =
@@ -295,7 +307,7 @@ local function flightThread()
                     motor.id,
                     {
                         speed = speed,
-                        tilt = motor.spin * 1
+                        tilt = motor.spin * 3
                     },
                     network
                 )
