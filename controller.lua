@@ -2,12 +2,31 @@
 -- Network
 --------------------------------------------------
 
-rednet.open("top")
+for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+        rednet.open(side)
+        print("Opened modem on " .. side)
+        break
+    end
+end
 
-local redstonelink = peripheral.wrap("back")
+local redstonelink = peripheral.find("redstone_link_bridge")  
+assert(redstonelink, "No redstone_link_bridge found")  
 
-local TARGET_ID = 11
-local CHANNEL = "Comm1"
+--------------------------------------------------
+-- config
+--------------------------------------------------
+
+if not fs.exists("motor.txt") then
+    error("Run controllerSetup.lua first")
+end
+
+local file = fs.open("controller.txt","r")
+local config = textutils.unserialize(file.readAll())
+file.close()
+
+local TARGET_ID = config.targetId
+local CHANNEL = config.channel
 
 --------------------------------------------------
 -- Settings
@@ -156,8 +175,8 @@ local function processInput(raw)
 
     out.fb = deadzone(raw.fb, DEADZONE)
     out.rl = deadzone(raw.rl, DEADZONE)
-    out.yc = deadzone(raw.yc, DEADZONE)
-    out.th = deadzone(raw.th, DEADZONE)
+    out.yc = deadzone(raw.yc, DEADZONE + 0.02)
+    out.th = deadzone(raw.th, DEADZONE + 0.02)
 
     --------------------------------------------------
     -- Expo
@@ -197,9 +216,8 @@ local function processInput(raw)
     --------------------------------------------------
 
     out.manual =
-        math.abs(out.fb) > 0.05 or
-        math.abs(out.rl) > 0.05
-
+        math.abs(out.fb) > 0.1 or
+        math.abs(out.rl) > 0.1 
     return out
 end
 

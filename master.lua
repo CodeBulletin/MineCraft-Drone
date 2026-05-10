@@ -32,7 +32,7 @@ local motors = config.motors
 -- Constants
 --------------------------------------------------
 local power = 8
-local yawPower = 14
+local yawPower = 8
 local targetAlt = 80
 local targetX = 0.5
 local targetZ = 0.5
@@ -122,8 +122,8 @@ local pitchRatePID = createPID(1.2, 0.02, 0.6)
 local rollRatePID  = createPID(1.2, 0.02, 0.6)
 local yawRatePID   = createPID(1.2, 0.02, 0.4)
 
-local altPID =  createPID(2.0, 0.0, 0.0)
-local velPID =  createPID(12.0, 0.8, 3.0)
+local altPID =  createPID(3.0, 0.0, 0.0)
+local velPID =  createPID(12.0, 0.8, 5.0)
 
 local posXPID =  createPID(0.5, 0.0, 0.0)
 local posZPID =  createPID(0.5, 0.0, 0.0)
@@ -166,6 +166,10 @@ local function flightThread()
     local targetPitch = 0
     local targetRoll = 0
     local targetYaw = 0 
+
+    local firstTick = true
+
+
     while true do
             local now = os.clock()
             local dt = now - lastTime
@@ -187,9 +191,23 @@ local function flightThread()
             local vx = vel.x
             local vz = vel.z
 
+            if firstTick then   
+                targetX = x
+                targetZ = z
+                targetAlt = alt
+                firstTick = false
+            end
+
             local pitchRate = ang.x
             local yawRate = ang.y
             local rollRate = ang.z
+
+            local climbRate = control.th * 6.0 
+            targetAlt = targetAlt + climbRate * dt
+            local targetVelRate = updatePID(altPID, targetAlt, alt, dt)
+            targetVelRate = clamp(targetVelRate, -10.0, 10.0)   
+            local velCorr = updatePID(velPID, targetVelRate, vy, dt)
+
             if math.abs(vx) < 0.02 then vx = 0 end
             if math.abs(vz) < 0.02 then vz = 0 end
 
@@ -199,26 +217,17 @@ local function flightThread()
             vx = vxFiltered
             vz = vzFiltered
 
-            
             if control.manual then
-
-                --------------------------------------------------
-                -- Direct stick control
-                --------------------------------------------------
-
                 targetPitch =
                     control.fb * 0.35
 
                 targetRoll =
                     -control.rl * 0.35
-
-                --------------------------------------------------
-                -- Update hover target
-                --------------------------------------------------
-
                 targetX = x
                 targetZ = z
-
+            elseif vel.y < -2.0 then
+                targetPitch = 0
+                targetRoll = 0
             else
 
                 local cosY = math.cos(yaw)
@@ -250,6 +259,7 @@ local function flightThread()
                 targetPitch = clamp(updatePID(velXPID, targetVZ, localVZ, dt), -0.25, 0.25)
                 targetRoll  = clamp(-updatePID(velZPID, targetVX, localVX, dt), -0.25, 0.25)
             end
+            
 
             -- xyz satbilzation
             local targetYawRate
@@ -270,19 +280,16 @@ local function flightThread()
                     )
             end
 
-            -- Pitch Roll Velocity Stablization
-            local climbRate = control.th * 3.0 
-            -------------------------------------------------- -- Limit descent speed --------------------------------------------------
-            targetAlt = targetAlt + climbRate * dt
+            -- Pitch Roll Stablization
 
-            local targetVelRate = updatePID(altPID, targetAlt, alt, dt)
             local targetPitchRate = updatePID(pitchPID, targetPitch, pitch, dt)
             local targetRollRate  = updatePID(rollPID, targetRoll, roll, dt)
 
-            targetVelRate = clamp(targetVelRate, -10.0, 10.0)
+            -- Calculate how much we are currently rotating (absolute value)
+            local currentYawActivity = math.abs(yawRate)
+            local yawCompensation = currentYawActivity * 2.5
 
-            local velCorr = updatePID(velPID, targetVelRate, vy, dt)
-            local throttle = math.max(30, math.min(baseThrottle + velCorr, 250));
+            local throttle = math.max(30, math.min(baseThrottle + velCorr - yawCompensation, 250));
             local tpaFactor = getTPA(throttle, baseThrottle)
 
             -- Error Calculations
@@ -290,23 +297,52 @@ local function flightThread()
             local pitchCorr = updatePID(pitchRatePID, targetPitchRate, pitchRate, dt) * power * tpaFactor
             local rollCorr  = updatePID(rollRatePID, targetRollRate, rollRate, dt) * power * tpaFactor       
 
-            for _, motor in ipairs(motors) do
-                local speed =
-                    throttle
-                    - pitchCorr * motor.z
-                    - rollCorr  * motor.x
-                    - yawCorr   * motor.spin
 
-                if not isValidNumber(speed) then
-                    speed = 0
-                end
+            --------------------------------------------------
+            -- Balanced Motor Mixer
+            --------------------------------------------------
+            local rawSpeeds = {}
+            local minSpeed = math.huge
+            local maxSpeed = -math.huge
+            local sumOffset = 0
 
-                speed = clampInt(speed,0,256)
+            for i, motor in ipairs(motors) do
+                -- Calculate only the PIDs contribution (offset from throttle)
+                local offset = - pitchCorr * motor.z
+                               - rollCorr  * motor.x
+                               - yawCorr   * motor.spin
+                
+                rawSpeeds[i] = offset
+                sumOffset = sumOffset + offset
+            end
 
+            -- Calculate how much the 'average' motor speed changed
+            -- This helps prevent the "climb on yaw" effect
+            local avgOffset = sumOffset / #motors
+            
+            for i=1, #rawSpeeds do
+                -- Add the requested throttle, but subtract the bias added by PIDs
+                rawSpeeds[i] = throttle + rawSpeeds[i] - avgOffset
+                
+                if rawSpeeds[i] < minSpeed then minSpeed = rawSpeeds[i] end
+                if rawSpeeds[i] > maxSpeed then maxSpeed = rawSpeeds[i] end
+            end
+
+            -- Air Mode / Saturation Prevention
+            local boost = 0
+            if minSpeed < 15 then
+                boost = 15 - minSpeed
+            elseif maxSpeed > 255 then
+                boost = 255 - maxSpeed -- This will be a negative number (reduction)
+            end
+
+            for i, motor in ipairs(motors) do
+                local finalSpeed = clampInt(rawSpeeds[i] + boost, 0, 255)
+                
                 rednet.send(
                     motor.id,
                     {
-                        speed = speed,
+                        speed = finalSpeed,
                         tilt = motor.spin * 3
                     },
                     network
@@ -317,7 +353,7 @@ local function flightThread()
             term.setCursorPos(1,1)
 
             print("=== DRONE STATE ===")
-            print(string.format("dt: %.4f freq: %0.4f", dt, 1.0/dt))
+            print(string.format("dt: %.4f freq: %0.4f ver: 1.0", dt, 1.0/dt))
 
             print("\n-- Orientation (radians) --")
             print(string.format("Pitch: %.3f", pitch))
