@@ -414,7 +414,7 @@ local function flightThread()
                         end
 
                         -- Path-frame velocity commands
-                        local vPathRight   = updatePID(pathCrossPID, 0, -cross, dt)
+                        local vPathRight   = updatePID(pathCrossPID, 0, cross, dt)
                         local vPathForward = updatePID(pathAlongPID, 0, -errAlong, dt)
 
                         -- Clamp to dynamic limits
@@ -679,7 +679,7 @@ local function flightThread()
             term.setCursorPos(1,1)
 
             print("=== DRONE STATE ===")
-            print(string.format("dt: %.4f freq: %0.4f ver: 1.2", dt, 1.0/dt))
+            print(string.format("dt: %.4f freq: %0.4f ver: 1.3", dt, 1.0/dt))
 
             print("\n-- Orientation (radians) --")
             print(string.format("Pitch: %.3f | %.3f", pitch, targetPitch))
