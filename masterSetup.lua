@@ -19,6 +19,10 @@ print("")
 write("Network Name: ")
 local NETWORK = read()
 
+print("")
+write("Controller Id: ")
+local CONTROLLER = read()
+
 --------------------------------------------------
 
 local motors = {}
@@ -93,6 +97,7 @@ local file = fs.open("config.txt","w")
 
 file.write(textutils.serialize({
     network = NETWORK,
+    controller = CONTROLLER,
     motors = motors
 }))
 
