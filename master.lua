@@ -43,6 +43,7 @@ local baseThrottle = 110
 local vxFiltered = 0    
 local vzFiltered = 0
 
+
 print("Master ready")
 
 --------------------------------------------------
@@ -133,6 +134,9 @@ local posZPID =  createPID(0.5, 0.0, 0.0)
 local velXPID =  createPID(0.05, 0.0, 0.03)
 local velZPID =  createPID(0.05, 0.0, 0.03)
 
+local pathCrossPID = createPID(0.6, 0.0, 0.3)   -- lateral correction back to line
+local pathAlongPID = createPID(0.6, 0.0, 0.3)   -- forward progress toward B
+
 local control = { fb = 0, rl = 0, yc = 0, th = 0, manual = false }
 
 --------------------------------------------------
@@ -157,6 +161,8 @@ local function networkThread()
                 control.targetX = msg.targetX
                 control.targetZ = msg.targetZ
                 control.targetY = msg.targetY   -- <<< ADD
+                control.prevX = msg.prevX
+                control.prevZ = msg.prevZ
             end
         end
     end
@@ -264,72 +270,157 @@ local function flightThread()
                 targetPitch = 0
                 targetRoll = 0
             else
-
                 if wasManual then
                     posXPID.integral = 0; posXPID.lastError = 0
                     posZPID.integral = 0; posZPID.lastError = 0
                     velXPID.integral = 0; velXPID.lastError = 0
                     velZPID.integral = 0; velZPID.lastError = 0
+                    pathCrossPID.integral = 0; pathCrossPID.lastError = 0
+                    pathAlongPID.integral = 0; pathAlongPID.lastError = 0
                     wasManual = false
                 end
 
-                if control.hasTarget then
-                    targetX = control.targetX
-                    targetZ = control.targetZ
-                else
-                    -- Normal position hold with 5-block soft reset
-                    local dx = targetX - x
-                    local dz = targetZ - z
-                    local distFromTarget = math.sqrt(dx*dx + dz*dz)
-                    if distFromTarget > 5 then
-                        targetX = x
-                        targetZ = z
-                        posXPID.integral = 0; posXPID.lastError = 0
-                        posZPID.integral = 0; posZPID.lastError = 0
-                        velXPID.integral = 0; velXPID.lastError = 0
-                        velZPID.integral = 0; velZPID.lastError = 0
+                -- Pre-compute drone-local velocity for both branches
+                local cosY = math.cos(yaw)
+                local sinY = math.sin(yaw)
+                local localVX = cosY * vx - sinY * vz
+                local localVZ = sinY * vx + cosY * vz
+
+                local velLimit, tiltLimit
+
+                -- ============================================================
+                -- AUTO PATH FOLLOWING
+                -- Face A->B direction. Correct laterally back to path line.
+                -- ============================================================
+                local inPathMode = control.hasTarget and control.prevX and control.prevZ
+                local pathDegenerate = false
+
+                if inPathMode then
+                    local px = control.targetX - control.prevX
+                    local pz = control.targetZ - control.prevZ
+                    if px*px + pz*pz < 0.0001 then
+                        pathDegenerate = true
                     end
                 end
 
-                local cosY = math.cos(yaw)
-                local sinY = math.sin(yaw)
+                if inPathMode and not pathDegenerate then
+                    local Ax, Az = control.prevX, control.prevZ
+                    local Bx, Bz = control.targetX, control.targetZ
 
-                local localVX =  cosY * vx - sinY * vz
-                local localVZ =  sinY * vx + cosY * vz
+                    local px = Bx - Ax
+                    local pz = Bz - Az
+                    local pathLen = math.sqrt(px*px + pz*pz)
 
-                local dx = targetX - x
-                local dz = targetZ - z
+                    -- Unit vectors of path frame (forward = A->B)
+                    local ufx = px / pathLen
+                    local ufz = pz / pathLen
+                    local urx = ufz           -- right vector (90° clockwise)
+                    local urz = -ufx
 
-                local localDX =  cosY * dx - sinY * dz
-                local localDZ =  sinY * dx + cosY * dz
+                    -- Drone position relative to A
+                    local dx = x - Ax
+                    local dz = z - Az
 
-                -- if math.abs(localDX) < 0.15 then
-                --     localDX = 0
-                -- end
+                    -- Along-track projection (clamped to segment so closest point is never past B)
+                    local along = dx*ufx + dz*ufz
+                    if along < 0 then along = 0 end
+                    if along > pathLen then along = pathLen end
 
-                -- if math.abs(localDZ) < 0.15 then
-                --     localDZ = 0
-                -- end
+                    -- Closest point on the A->B line
+                    local cx = Ax + along*ufx
+                    local cz = Az + along*ufz
 
-                local targetVX = updatePID(posXPID, 0, -localDX, dt)
-                local targetVZ = updatePID(posZPID, 0, -localDZ, dt)
+                    -- Signed cross-track error (+ = right of path, - = left)
+                    local cross = (x - cx)*urx + (z - cz)*urz
 
-                local distToTarget = math.sqrt(dx*dx + dz*dz)
+                    -- Errors in path frame: we want cross=0, along=pathLen
+                    local errCross = -cross          -- lateral deviation
+                    local errAlong = pathLen - along -- remaining distance to B
 
-                local velLimit, tiltLimit
-                if control.hasTarget and distToTarget > 10 then
-                    velLimit = 20.0
-                    tiltLimit = 0.4
+                    -- Path-frame velocity commands
+                    local vPathRight = updatePID(pathCrossPID, 0, -errCross, dt)
+                    local vPathForward = updatePID(pathAlongPID, 0, -errAlong, dt)
+
+                    -- Distance to final target for limit tapering
+                    local dxB = Bx - x
+                    local dzB = Bz - z
+                    local distToTarget = math.sqrt(dxB*dxB + dzB*dzB)
+
+                    if distToTarget > 10 then
+                        velLimit = 20.0
+                        tiltLimit = 0.4
+                    else
+                        velLimit = 3.0
+                        tiltLimit = 0.15
+                    end
+
+                    vPathRight = clamp(vPathRight, -velLimit, velLimit)
+                    vPathForward = clamp(vPathForward, -velLimit, velLimit)
+
+                    -- Rotate path-frame velocity into drone-local frame
+                    local pathYaw = math.atan2(px, pz)  -- direction of A->B
+                    local yawDiff = yaw - pathYaw
+                    local cDiff = math.cos(yawDiff)
+                    local sDiff = math.sin(yawDiff)
+
+                    local targetVX = cDiff * vPathRight - sDiff * vPathForward
+                    local targetVZ = sDiff * vPathRight + cDiff * vPathForward
+
+                    -- Existing velocity PIDs in drone local frame -> pitch/roll
+                    targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
+                    targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
+
+                    -- Lock yaw to path direction (smoothly via yawPID later)
+                    targetYaw = pathYaw
+
                 else
-                    velLimit = 3.0
-                    tiltLimit = 0.15
+                    -- ============================================================
+                    -- NORMAL POSITION HOLD (manual or no valid path segment)
+                    -- ============================================================
+                    if control.hasTarget then
+                        targetX = control.targetX
+                        targetZ = control.targetZ
+                        if control.targetY then
+                            targetAlt = control.targetY
+                        end
+                    else
+                        -- 5-block soft reset
+                        local dx = targetX - x
+                        local dz = targetZ - z
+                        local distFromTarget = math.sqrt(dx*dx + dz*dz)
+                        if distFromTarget > 5 then
+                            targetX = x
+                            targetZ = z
+                            posXPID.integral = 0; posXPID.lastError = 0
+                            posZPID.integral = 0; posZPID.lastError = 0
+                            velXPID.integral = 0; velXPID.lastError = 0
+                            velZPID.integral = 0; velZPID.lastError = 0
+                        end
+                    end
+
+                    local dx = targetX - x
+                    local dz = targetZ - z
+                    local localDX = cosY * dx - sinY * dz
+                    local localDZ = sinY * dx + cosY * dz
+
+                    local targetVX = updatePID(posXPID, 0, -localDX, dt)
+                    local targetVZ = updatePID(posZPID, 0, -localDZ, dt)
+
+                    local distToTarget = math.sqrt(dx*dx + dz*dz)
+                    if distToTarget > 10 then
+                        velLimit = 20.0
+                        tiltLimit = 0.4
+                    else
+                        velLimit = 3.0
+                        tiltLimit = 0.15
+                    end
+
+                    targetVX = clamp(targetVX, -velLimit, velLimit)
+                    targetVZ = clamp(targetVZ, -velLimit, velLimit)
+
+                    targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
+                    targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
                 end
-
-                targetVX = clamp(targetVX, -velLimit, velLimit)
-                targetVZ = clamp(targetVZ, -velLimit, velLimit)
-
-                targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
-                targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
             end
             
             -- Yaw stabilization
@@ -337,28 +428,27 @@ local function flightThread()
             local yawStickActive = math.abs(control.yc) > 0.4
 
             if yawStickActive then
-                -- Manual rate control
+                -- Manual rate control always overrides everything
                 targetYawRate = control.yc * 4.0
-                targetYaw = yaw          -- keep updating so we know where we are
+                targetYaw = yaw
                 wasYawing = true
             else
                 if wasYawing then
-                    -- Stick just released: snap target to current heading
-                    targetYaw = yaw
+                    -- Stick just released
+                    if not (control.hasTarget and control.prevX and control.prevZ) then
+                        -- Only snap to current heading if NOT in auto path mode
+                        targetYaw = yaw
+                    end
                     wasYawing = false
-
-                    -- CRITICAL: clear stale history so old errors don't bias the hold
-                    yawPID.integral = 0
-                    yawPID.lastError = 0
-                    yawRatePID.integral = 0
-                    yawRatePID.lastError = 0
+                    yawPID.integral = 0; yawPID.lastError = 0
+                    yawRatePID.integral = 0; yawRatePID.lastError = 0
                 end
 
-                -- Position hold with natural damping
-                -- D term sees error growing during overshoot and fights it immediately
+                -- In auto path mode, targetYaw was already locked to pathYaw above
+                -- In normal mode, targetYaw is whatever was set previously
+
                 targetYawRate = updatePID(yawPID, angleDiff(targetYaw, yaw), 0, dt)
             end
-
             -- Pitch Roll Stablization
 
             local pitchError = angleDiff(targetPitch, pitch)
@@ -512,9 +602,9 @@ local function flightThread()
             print(string.format("dt: %.4f freq: %0.4f ver: 1.1", dt, 1.0/dt))
 
             print("\n-- Orientation (radians) --")
-            print(string.format("Pitch: %.3f", pitch))
-            print(string.format("Roll : %.3f", roll))
-            print(string.format("Yaw  : %.3f", yaw))
+            print(string.format("Pitch: %.3f | %.3f", pitch, targetPitch))
+            print(string.format("Roll : %.3f | %.3f", roll, targetRoll))
+            print(string.format("Yaw  : %.3f | %.3f", yaw, targetYaw))
 
             print("\n-- Altitued --")
             print(string.format("X Y Z  : %.3f %.3f %.3f", pose.position.x, pose.position.y, pose.position.z))

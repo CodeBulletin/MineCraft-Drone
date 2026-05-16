@@ -114,6 +114,7 @@ local lastHeartbeat = 0
 local txCount = 0
 local rxCount = 0
 local lastRaw = { f=0, b=0, r=0, l=0, u=0, d=0, yr=0, yl=0 }
+local prevX, prevZ
 
 --------------------------------------------------
 -- Helpers
@@ -378,6 +379,18 @@ local function txThread()
                 targetZ = wp.z
                 targetY = wp.y or (droneTelemetry and droneTelemetry.y or 80)
 
+                -- Previous point defines the path segment A→B
+                if autoIndex > 1 then
+                    prevX = waypoints[autoIndex - 1].x
+                    prevZ = waypoints[autoIndex - 1].z
+                elseif droneTelemetry then
+                    prevX = droneTelemetry.x
+                    prevZ = droneTelemetry.z
+                else
+                    prevX = targetX
+                    prevZ = targetZ
+                end
+
                 if droneTelemetry then
                     local dx = wp.x - droneTelemetry.x
                     local dz = wp.z - droneTelemetry.z
@@ -402,6 +415,20 @@ local function txThread()
                 targetX = wp.x
                 targetZ = wp.z
                 targetY = wp.y or targetY  -- <<< ADD (preserve last known)
+
+
+                if not prevX then
+                    if autoIndex > 1 then
+                        prevX = waypoints[autoIndex - 1].x
+                        prevZ = waypoints[autoIndex - 1].z
+                    elseif droneTelemetry then
+                        prevX = droneTelemetry.x
+                        prevZ = droneTelemetry.z
+                    else
+                        prevX = targetX
+                        prevZ = targetZ
+                    end
+                end
 
                 autoWaitTimer = autoWaitTimer - dt
                 if autoWaitTimer <= 0 then
@@ -432,6 +459,8 @@ local function txThread()
             packet.targetX = targetX
             packet.targetZ = targetZ
             packet.targetY = targetY   -- <<< ADD
+            packet.prevX = prevX
+            packet.prevZ = prevZ
         end
 
         local targetChanged = hasTarget ~= (lastSent and lastSent.hasTarget or false)
