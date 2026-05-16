@@ -113,6 +113,11 @@ local function getTPA(throttle, base)
     return 1.0
 end
 
+local function normalizeAngle(a)
+    while a > math.pi do a = a - 2*math.pi end
+    while a < -math.pi do a = a + 2*math.pi end
+    return a
+end
 --------------------------------------------------
 -- PID
 --------------------------------------------------
@@ -290,7 +295,6 @@ local function flightThread()
 
                 -- ============================================================
                 -- AUTO PATH FOLLOWING
-                -- Face A->B direction. Correct laterally back to path line.
                 -- ============================================================
                 local inPathMode = control.hasTarget and control.prevX and control.prevZ
                 local pathDegenerate = false
@@ -321,57 +325,124 @@ local function flightThread()
                     local dx = x - Ax
                     local dz = z - Az
 
-                    -- Along-track projection (clamped to segment so closest point is never past B)
-                    local along = dx*ufx + dz*ufz
-                    if along < 0 then along = 0 end
-                    if along > pathLen then along = pathLen end
+                    -- UNCLAMPED projection: t > 1 means overshoot past B
+                    local proj = dx*ufx + dz*ufz
+                    local t = proj / pathLen
 
-                    -- Closest point on the A->B line
-                    local cx = Ax + along*ufx
-                    local cz = Az + along*ufz
+                    -- Closest point on the A->B segment (clamped for cross-track only)
+                    local closestT = clamp(t, 0, 1)
+                    local cx = Ax + closestT*px
+                    local cz = Az + closestT*pz
 
                     -- Signed cross-track error (+ = right of path, - = left)
                     local cross = (x - cx)*urx + (z - cz)*urz
 
-                    -- Errors in path frame: we want cross=0, along=pathLen
-                    local errCross = -cross          -- lateral deviation
-                    local errAlong = pathLen - along -- remaining distance to B
-
-                    -- Path-frame velocity commands
-                    local vPathRight = updatePID(pathCrossPID, 0, -errCross, dt)
-                    local vPathForward = updatePID(pathAlongPID, 0, -errAlong, dt)
-
-                    -- Distance to final target for limit tapering
+                    -- Distance and horizontal velocity to endpoint B
                     local dxB = Bx - x
                     local dzB = Bz - z
-                    local distToTarget = math.sqrt(dxB*dxB + dzB*dzB)
+                    local distToB = math.sqrt(dxB*dxB + dzB*dzB)
+                    local hVel = math.sqrt(vx*vx + vz*vz)
 
-                    if distToTarget > 10 then
-                        velLimit = 20.0
-                        tiltLimit = 0.4
-                    else
-                        velLimit = 3.0
-                        tiltLimit = 0.15
+                    -- Arrival tolerance: must be close AND slow
+                    local ARRIVE_DIST = 1.0
+                    local ARRIVE_VEL = 0.5
+                    local isArrived = distToB < ARRIVE_DIST and hVel < ARRIVE_VEL
+
+                    -- Dynamic deceleration profile (smoothstep)
+                    local maxVel = 20.0
+                    local minVel = 0.5
+                    local approachFactor = clamp(distToB / 10.0, 0, 1)
+                    approachFactor = approachFactor * approachFactor * (3 - 2 * approachFactor)
+                    velLimit = minVel + approachFactor * (maxVel - minVel)
+                    tiltLimit = 0.08 + approachFactor * (0.4 - 0.08)
+
+                    -- True geometric path direction (locked for entire segment)
+                    local pathYaw = math.atan2(px, pz)
+
+                    -- Smoothly slew targetYaw toward pathYaw (3 rad/s max)
+                    local yawError = angleDiff(pathYaw, targetYaw)
+                    local YAW_SLEW_RATE = 3.0
+                    local maxYawStep = YAW_SLEW_RATE * dt
+                    if math.abs(yawError) > maxYawStep then
+                        yawError = yawError > 0 and maxYawStep or -maxYawStep
                     end
+                    targetYaw = normalizeAngle(targetYaw + yawError)
 
-                    vPathRight = clamp(vPathRight, -velLimit, velLimit)
-                    vPathForward = clamp(vPathForward, -velLimit, velLimit)
+                    if isArrived then
+                        -- --------------------------------------------------
+                        -- ARRIVED: hold position at B using position PIDs
+                        -- --------------------------------------------------
+                        pathCrossPID.integral = 0; pathCrossPID.lastError = 0
+                        pathAlongPID.integral = 0; pathAlongPID.lastError = 0
 
-                    -- Rotate path-frame velocity into drone-local frame
-                    local pathYaw = math.atan2(px, pz)  -- direction of A->B
-                    local yawDiff = yaw - pathYaw
-                    local cDiff = math.cos(yawDiff)
-                    local sDiff = math.sin(yawDiff)
+                        targetX = Bx
+                        targetZ = Bz
 
-                    local targetVX = cDiff * vPathRight - sDiff * vPathForward
-                    local targetVZ = sDiff * vPathRight + cDiff * vPathForward
+                        local pdx = targetX - x
+                        local pdz = targetZ - z
+                        local localDX = cosY * pdx - sinY * pdz
+                        local localDZ = sinY * pdx + cosY * pdz
 
-                    -- Existing velocity PIDs in drone local frame -> pitch/roll
-                    targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
-                    targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
+                        local targetVX = updatePID(posXPID, 0, -localDX, dt)
+                        local targetVZ = updatePID(posZPID, 0, -localDZ, dt)
 
-                    -- Lock yaw to path direction (smoothly via yawPID later)
-                    targetYaw = pathYaw
+                        -- Very tight limits when holding
+                        local holdLimit = 0.5
+                        targetVX = clamp(targetVX, -holdLimit, holdLimit)
+                        targetVZ = clamp(targetVZ, -holdLimit, holdLimit)
+
+                        -- Deadzone to prevent creeping while holding
+                        if math.abs(targetVX) < 0.2 then targetVX = 0 end
+                        if math.abs(targetVZ) < 0.2 then targetVZ = 0 end
+
+                        targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
+                        targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
+                        -- targetYaw already updated above, maintain heading
+
+                    else
+                        -- --------------------------------------------------
+                        -- EN ROUTE: follow path with overshoot correction
+                        -- --------------------------------------------------
+
+                        -- Along-track error: positive = before B, negative = overshoot
+                        local errAlong = pathLen - proj
+
+                        -- If we overshot, reset forward PID state so accumulated
+                        -- bias doesn't fight the reverse command
+                        if t > 1.0 and pathAlongPID.integral > 0 then
+                            pathAlongPID.integral = 0
+                        end
+
+                        -- Path-frame velocity commands
+                        local vPathRight   = updatePID(pathCrossPID, 0, -cross, dt)
+                        local vPathForward = updatePID(pathAlongPID, 0, -errAlong, dt)
+
+                        -- Clamp to dynamic limits
+                        vPathRight   = clamp(vPathRight, -velLimit, velLimit)
+                        vPathForward = clamp(vPathForward, -velLimit, velLimit)
+
+                        -- Minimum-velocity deadzone: kill tiny commands that cause drift
+                        local VEL_DEADZONE = 0.25
+                        if math.abs(vPathForward) < VEL_DEADZONE then
+                            vPathForward = 0
+                        end
+                        if math.abs(vPathRight) < VEL_DEADZONE then
+                            vPathRight = 0
+                        end
+
+                        -- Rotate path-frame velocity into drone-local frame
+                        -- Use true pathYaw (not slewed targetYaw) for velocity alignment
+                        local yawDiff = yaw - pathYaw
+                        local cDiff = math.cos(yawDiff)
+                        local sDiff = math.sin(yawDiff)
+
+                        local targetVX = cDiff * vPathRight - sDiff * vPathForward
+                        local targetVZ = sDiff * vPathRight + cDiff * vPathForward
+
+                        targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
+                        targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
+                        -- targetYaw already updated above
+                    end
 
                 else
                     -- ============================================================
@@ -381,7 +452,7 @@ local function flightThread()
                         targetX = control.targetX
                         targetZ = control.targetZ
                         if control.targetY then
-                            targetAlt = control.targetY
+                            targetY = control.targetY
                         end
                     else
                         -- 5-block soft reset
@@ -418,12 +489,16 @@ local function flightThread()
                     targetVX = clamp(targetVX, -velLimit, velLimit)
                     targetVZ = clamp(targetVZ, -velLimit, velLimit)
 
+                    -- Deadzone to prevent creeping in position hold
+                    if math.abs(targetVX) < 0.2 then targetVX = 0 end
+                    if math.abs(targetVZ) < 0.2 then targetVZ = 0 end
+
                     targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
                     targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
                 end
             end
             
-            -- Yaw stabilization
+            -- Yaw stabilization    
             local targetYawRate
             local yawStickActive = math.abs(control.yc) > 0.4
 
@@ -444,10 +519,15 @@ local function flightThread()
                     yawRatePID.integral = 0; yawRatePID.lastError = 0
                 end
 
-                -- In auto path mode, targetYaw was already locked to pathYaw above
-                -- In normal mode, targetYaw is whatever was set previously
+                -- In auto path mode, targetYaw was already locked/slewed above.
+                -- In normal mode, targetYaw is whatever was set previously.
 
-                targetYawRate = updatePID(yawPID, angleDiff(targetYaw, yaw), 0, dt)
+                local yawError = angleDiff(targetYaw, yaw)
+                local YAW_DEADBAND = 0.03  -- ~1.7 degrees
+                if math.abs(yawError) < YAW_DEADBAND then
+                    yawError = 0
+                end
+                targetYawRate = updatePID(yawPID, yawError, 0, dt)
             end
             -- Pitch Roll Stablization
 
@@ -599,7 +679,7 @@ local function flightThread()
             term.setCursorPos(1,1)
 
             print("=== DRONE STATE ===")
-            print(string.format("dt: %.4f freq: %0.4f ver: 1.1", dt, 1.0/dt))
+            print(string.format("dt: %.4f freq: %0.4f ver: 1.2", dt, 1.0/dt))
 
             print("\n-- Orientation (radians) --")
             print(string.format("Pitch: %.3f | %.3f", pitch, targetPitch))

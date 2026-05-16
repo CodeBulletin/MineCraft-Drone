@@ -42,6 +42,7 @@ local lastManual = false
 local arriveTimer = 0
 local droneTelemetry = nil
 local lastTelemetryTime = 0
+local lastAutoIndex = 0
 
 local AUTO_RESUME_DELAY = 2.0
 local WAYPOINT_ARRIVE_DIST = 1.0
@@ -380,15 +381,22 @@ local function txThread()
                 targetY = wp.y or (droneTelemetry and droneTelemetry.y or 80)
 
                 -- Previous point defines the path segment A→B
-                if autoIndex > 1 then
-                    prevX = waypoints[autoIndex - 1].x
-                    prevZ = waypoints[autoIndex - 1].z
-                elseif droneTelemetry then
-                    prevX = droneTelemetry.x
-                    prevZ = droneTelemetry.z
-                else
-                    prevX = targetX
-                    prevZ = targetZ
+                if autoIndex ~= lastAutoIndex then
+                    if autoIndex > 1 then
+                        prevX = waypoints[autoIndex - 1].x
+                        prevZ = waypoints[autoIndex - 1].z
+                        lastAutoIndex = autoIndex
+                    elseif droneTelemetry then
+                        -- First waypoint: capture drone position ONCE at segment start
+                        prevX = droneTelemetry.x
+                        prevZ = droneTelemetry.z
+                        lastAutoIndex = autoIndex
+                    else
+                        -- No telemetry yet; defer locking. Flight computer will
+                        -- position-hold until we send a valid start point.
+                        prevX = nil
+                        prevZ = nil
+                    end
                 end
 
                 if droneTelemetry then
@@ -464,7 +472,12 @@ local function txThread()
         end
 
         local targetChanged = hasTarget ~= (lastSent and lastSent.hasTarget or false)
-            or (hasTarget and lastSent and (targetX ~= lastSent.targetX or targetZ ~= lastSent.targetZ))
+            or (hasTarget and lastSent and (
+                targetX ~= lastSent.targetX
+                or targetZ ~= lastSent.targetZ
+                or prevX ~= lastSent.prevX
+                or prevZ ~= lastSent.prevZ
+            ))
 
         if changed(input, lastSent) or now - lastHeartbeat > HEARTBEAT_TIME or targetChanged then
             rednet.send(TARGET_ID, packet, CHANNEL)
