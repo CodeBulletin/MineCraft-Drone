@@ -43,10 +43,14 @@ local arriveTimer = 0
 local droneTelemetry = nil
 local lastTelemetryTime = 0
 local lastAutoIndex = 0
+local WAIT_TIME = 5.0
 
 local AUTO_RESUME_DELAY = 2.0
-local WAYPOINT_ARRIVE_DIST = 1.0
+local WAYPOINT_ARRIVE_DIST = 2.0
 local WAYPOINT_ARRIVE_VEL = 0.5
+-- Tolerances for alignment checks
+local WAYPOINT_ARRIVE_ALT = 1.5
+local WAYPOINT_ARRIVE_YAW = 0.15
 local ARRIVE_SUSTAIN = 0.5
 
 local function loadWaypoints()
@@ -58,11 +62,21 @@ local function loadWaypoints()
         if not line then break end
         line = line:gsub("%s+", "")
         if line ~= "" and not line:find("^%-%-") then
-            local xStr, zStr, yStr = line:match("([^,]+),([^,]+),([^,]+)")
-            if xStr and zStr then
-                local wx, wz, wy = tonumber(xStr), tonumber(zStr), tonumber(yStr) 
-                if wx and wz then
-                    table.insert(waypoints, {x = wx, z = wz, y = wy})
+            -- Format matches: x, z, y, yaw, alt_change
+            local xStr, zStr, yStr, yawStr, aStr = line:match("([^,]+),([^,]+),([^,]+),?([^,]*),?([^,]*)")
+            if xStr and zStr and yStr then
+                local wx, wz, wy = tonumber(xStr), tonumber(zStr), tonumber(yStr)
+                local wyaw = tonumber(yawStr) or 0
+                local waltChange = tonumber(aStr) or 0 -- 5th parameter: altitude change upon arrival
+
+                if wx and wz and wy then
+                    table.insert(waypoints, {
+                        x = wx, 
+                        z = wz, 
+                        y = wy, 
+                        yaw = wyaw,
+                        altChange = waltChange
+                    })
                 end
             end
         end
@@ -143,6 +157,14 @@ end
 
 local function smooth(new, old, factor)
     return old + (new - old) * factor
+end
+
+local function angleDiff(a, b)
+    local diff = (a - b) % (2 * math.pi)
+    if diff > math.pi then
+        diff = diff - 2 * math.pi
+    end
+    return diff
 end
 
 local function changed(a, b)
@@ -282,7 +304,7 @@ local function drawDebugUI(raw, input, hasTarget, targetX, targetZ, targetY, now
     term.setCursorPos(1, y); term.write(string.format("MANUAL: %s", tostring(input.manual))); y = y + 1
     term.setCursorPos(1, y); term.write(string.format("AUTO:   %s %s", tostring(autoMode), autoState)); y = y + 1
     if hasTarget then
-        term.setCursorPos(1, y); term.write(string.format("TGT: %.1f, %.1f %.1f", targetX, targetZ, targetY)); y = y + 1
+        term.setCursorPos(1, y); term.write(string.format("TGT: %.1f, %.1f, %.1f", targetX, targetZ, targetY)); y = y + 1
     end
 
     -- RIGHT COLUMN
@@ -307,7 +329,8 @@ local function drawDebugUI(raw, input, hasTarget, targetX, targetZ, targetY, now
         term.setCursorPos(col + 2, y); term.write(string.format("WP:   %d / %d", autoIndex, #waypoints)); y = y + 1
         if waypoints[autoIndex] then
             local wp = waypoints[autoIndex]
-            term.setCursorPos(col + 2, y); term.write(string.format("CUR:  %.1f, %.1f", wp.x, wp.z)); y = y + 1
+            term.setCursorPos(col + 2, y); term.write(string.format("CUR:  %.1f, %.1f, %.1f", wp.x, wp.z, wp.y)); y = y + 1
+            term.setCursorPos(col + 2, y); term.write(string.format("YAW:  %.2f rad", wp.yaw)); y = y + 1
             if droneTelemetry and autoState == "moving" then
                 local dx = wp.x - droneTelemetry.x
                 local dz = wp.z - droneTelemetry.z
@@ -336,14 +359,13 @@ end
 --------------------------------------------------
 
 local function txThread()
-    local lastTime = os.clock()   -- <<< ADD THIS
+    local lastTime = os.clock()
     
     while true do
         local raw = getRawInput()
         local input = processInput(raw)
         local now = os.clock()
         
-        -- <<< ADD THIS BLOCK
         local dt = now - lastTime
         if dt <= 0 then dt = 0.001 end
         lastTime = now
@@ -354,6 +376,7 @@ local function txThread()
         local manualActive = input.manual
         local hasTarget = false
         local targetX, targetZ, targetY
+        local useTargetYaw = false
 
         if manualActive then
             manualPauseTimer = 0
@@ -372,44 +395,62 @@ local function txThread()
             autoState = "moving"
         end
 
-        if autoMode and not manualActive then
-            if autoState == "moving" then
-                local wp = waypoints[autoIndex]
-                hasTarget = true
-                targetX = wp.x
-                targetZ = wp.z
-                targetY = wp.y or (droneTelemetry and droneTelemetry.y or 80)
+local wp = waypoints[autoIndex]
 
-                -- Previous point defines the path segment A→B
+        if autoMode and not manualActive and wp then
+            hasTarget = true
+            targetX = wp.x
+            targetZ = wp.z
+
+            -- 1. Determine what our targeted altitude is right now based on our state
+            local currentTrackedY = wp.y
+            if autoState == "waiting" then
+                currentTrackedY = wp.y + wp.altChange
+            end
+            
+            -- Apply it to the outgoing packet target
+            targetY = currentTrackedY
+
+            if autoState == "moving" then
                 if autoIndex ~= lastAutoIndex then
                     if autoIndex > 1 then
                         prevX = waypoints[autoIndex - 1].x
                         prevZ = waypoints[autoIndex - 1].z
                         lastAutoIndex = autoIndex
                     elseif droneTelemetry then
-                        -- First waypoint: capture drone position ONCE at segment start
                         prevX = droneTelemetry.x
                         prevZ = droneTelemetry.z
                         lastAutoIndex = autoIndex
                     else
-                        -- No telemetry yet; defer locking. Flight computer will
-                        -- position-hold until we send a valid start point.
                         prevX = nil
                         prevZ = nil
                     end
                 end
 
+                useTargetYaw = false -- Look in direction of travel
                 if droneTelemetry then
                     local dx = wp.x - droneTelemetry.x
                     local dz = wp.z - droneTelemetry.z
                     local dist = math.sqrt(dx*dx + dz*dz)
                     local hVel = math.sqrt(droneTelemetry.vx^2 + droneTelemetry.vz^2)
+                    
+                    -- FIX: Calculate altErr using the correctly tracked target value!
+                    local altErr = math.abs(currentTrackedY - droneTelemetry.y)
 
-                    if dist < WAYPOINT_ARRIVE_DIST and hVel < WAYPOINT_ARRIVE_VEL then
-                        arriveTimer = arriveTimer + dt
-                        if arriveTimer >= ARRIVE_SUSTAIN then
-                            autoState = "waiting"
-                            autoWaitTimer = 30.0
+                    if dist < WAYPOINT_ARRIVE_DIST then
+                        useTargetYaw = true 
+                        local yawErr = math.abs(angleDiff(wp.yaw, droneTelemetry.yaw))
+
+                        -- If position, flight velocity, active altitude, and yaw match up:
+                        if hVel < WAYPOINT_ARRIVE_VEL and altErr < WAYPOINT_ARRIVE_ALT and yawErr < WAYPOINT_ARRIVE_YAW then
+                            arriveTimer = arriveTimer + dt
+                            if arriveTimer >= ARRIVE_SUSTAIN then
+                                -- Target Reached! Switch to waiting phase (it will now switch to wp.y + wp.altChange)
+                                autoState = "waiting"
+                                autoWaitTimer = WAIT_TIME
+                                arriveTimer = 0
+                            end
+                        else
                             arriveTimer = 0
                         end
                     else
@@ -418,12 +459,8 @@ local function txThread()
                 end
 
             elseif autoState == "waiting" then
-                local wp = waypoints[autoIndex]
-                hasTarget = true
-                targetX = wp.x
-                targetZ = wp.z
-                targetY = wp.y or targetY  -- <<< ADD (preserve last known)
-
+                useTargetYaw = true -- Lock heading to waypoint's targeted angle
+                -- targetY is already set to wp.y + wp.altChange up above via currentTrackedY!
 
                 if not prevX then
                     if autoIndex > 1 then
@@ -438,7 +475,26 @@ local function txThread()
                     end
                 end
 
-                autoWaitTimer = autoWaitTimer - dt
+                -- Dynamic Drift Checking
+                local isStable = false
+                if droneTelemetry then
+                    local dx = wp.x - droneTelemetry.x
+                    local dz = wp.z - droneTelemetry.z
+                    local dist = math.sqrt(dx*dx + dz*dz)
+                    local hVel = math.sqrt(droneTelemetry.vx^2 + droneTelemetry.vz^2)
+                    local altErr = math.abs(currentTrackedY - droneTelemetry.y)
+                    local yawErr = math.abs(angleDiff(wp.yaw, droneTelemetry.yaw))
+
+                    if dist < WAYPOINT_ARRIVE_DIST and hVel < WAYPOINT_ARRIVE_VEL and altErr < WAYPOINT_ARRIVE_ALT and yawErr < WAYPOINT_ARRIVE_YAW then
+                        isStable = true
+                    end
+                end
+
+                -- Only tick countdown if drone maintains targeted tolerances
+                if isStable then
+                    autoWaitTimer = autoWaitTimer - dt
+                end
+
                 if autoWaitTimer <= 0 then
                     autoIndex = autoIndex + 1
                     if autoIndex > #waypoints then
@@ -466,9 +522,11 @@ local function txThread()
         if hasTarget then
             packet.targetX = targetX
             packet.targetZ = targetZ
-            packet.targetY = targetY   -- <<< ADD
+            packet.targetY = targetY   
             packet.prevX = prevX
             packet.prevZ = prevZ
+            packet.targetYaw = wp.yaw          -- Transmit targeted orientation
+            packet.useTargetYaw = useTargetYaw -- Flag telling flight computer whether to execute path vs target yaw
         end
 
         local targetChanged = hasTarget ~= (lastSent and lastSent.hasTarget or false)
@@ -477,6 +535,8 @@ local function txThread()
                 or targetZ ~= lastSent.targetZ
                 or prevX ~= lastSent.prevX
                 or prevZ ~= lastSent.prevZ
+                or packet.targetYaw ~= lastSent.targetYaw
+                or packet.useTargetYaw ~= lastSent.useTargetYaw
             ))
 
         if changed(input, lastSent) or now - lastHeartbeat > HEARTBEAT_TIME or targetChanged then
@@ -489,7 +549,11 @@ local function txThread()
                 th = input.th,
                 hasTarget = hasTarget,
                 targetX = targetX,
-                targetZ = targetZ
+                targetZ = targetZ,
+                prevX = prevX,
+                prevZ = prevZ,
+                targetYaw = packet.targetYaw,
+                useTargetYaw = packet.useTargetYaw
             }
             lastHeartbeat = now
         end

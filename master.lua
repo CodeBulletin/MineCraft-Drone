@@ -150,8 +150,33 @@ local control = { fb = 0, rl = 0, yc = 0, th = 0, manual = false }
 --------------------------------------------------
 
 local function networkThread()
+    -- Proactive Handshake: Send an immediate ping to wake up a pre-running controller
+    local pose = sublevel.getLogicalPose()
+    local vel = sublevel.getLinearVelocity()
+    local p, y, r = pose.orientation:toEuler()
+    local bootPing = {
+        type = "telemetry",
+        x = pose.position.x,
+        y = pose.position.y,
+        z = pose.position.z,
+        vx = vel.x,
+        vy = vel.y,
+        vz = vel.z,
+        yaw = y,
+        pitch = p,
+        roll = r,
+    }
+
+    if controllerId then
+        rednet.send(controllerId, bootPing, network)
+    else
+        -- Fallback: Broadcast if the master setup doesn't have a saved controller ID
+        rednet.broadcast(bootPing, network)
+    end
+
     while true do
-        local id, msg = rednet.receive("Comm1")
+        -- FIX: Listen on the dynamic 'network' variable instead of hardcoded "Comm1"
+        local id, msg = rednet.receive(network)
         if not controllerId then
             controllerId = id
         end
@@ -169,6 +194,8 @@ local function networkThread()
                 control.targetY = msg.targetY   -- <<< ADD
                 control.prevX = msg.prevX
                 control.prevZ = msg.prevZ
+                control.targetYaw = msg.targetYaw          -- <<< ADD
+                control.useTargetYaw = msg.useTargetYaw    -- <<< ADD
             end
         end
     end
@@ -272,9 +299,6 @@ local function flightThread()
                 targetRoll = -control.rl * 0.35
                 targetX = x
                 targetZ = z
-            elseif vel.y < -2.0 then
-                targetPitch = 0
-                targetRoll = 0
             else
                 if wasManual then
                     posXPID.integral = 0; posXPID.lastError = 0
@@ -362,8 +386,14 @@ local function flightThread()
                     -- True geometric path direction (locked for entire segment)
                     local pathYaw = math.atan2(px, pz)
 
-                    -- Smoothly slew targetYaw toward pathYaw
-                    local yawError = angleDiff(pathYaw, targetYaw)
+                    -- NEW: Determine what heading target we are actively pointing toward
+                    local desiredHeading = pathYaw
+                    if control.useTargetYaw and control.targetYaw then
+                        desiredHeading = control.targetYaw
+                    end
+
+                    -- Smoothly slew targetYaw toward our active desiredHeading target
+                    local yawError = angleDiff(desiredHeading, targetYaw)
                     local YAW_SLEW_RATE = 3.0
                     local maxYawStep = YAW_SLEW_RATE * dt
                     if math.abs(yawError) > maxYawStep then
@@ -371,18 +401,19 @@ local function flightThread()
                     end
                     targetYaw = normalizeAngle(targetYaw + yawError)
 
+
                     --------------------------------------------------
                     -- ALIGNMENT CHECK
                     --------------------------------------------------
                     -- Identify if this is a new path we haven't aligned to yet
-                    local currentPathKey = tostring(Bx) .. "_" .. tostring(Bz) .. "_" .. tostring(control.targetY)
+                    local currentPathKey = tostring(Bx) .. "_" .. tostring(Bz)
                     if activePathKey ~= currentPathKey then
                         alignState = true
                         activePathKey = currentPathKey
                     end
 
-                    -- Calculate real-world alignment errors
-                    local yawErrorActual = math.abs(angleDiff(pathYaw, yaw))
+                    -- Calculate real-world alignment errors against our active target heading
+                    local yawErrorActual = math.abs(angleDiff(desiredHeading, yaw))
                     local altErrorActual = math.abs(targetY - alt)
 
                     -- Calculate velocity magnitudes to ensure mechanical stabilization
@@ -696,7 +727,7 @@ local function flightThread()
             term.setCursorPos(1,1)
 
             print("=== DRONE STATE ===")
-            print(string.format("dt: %.4f freq: %0.4f ver: 1.4", dt, 1.0/dt))
+            print(string.format("dt: %.4f freq: %0.4f ver: 1.5", dt, 1.0/dt))
 
             print("\n-- Orientation (radians) --")
             print(string.format("Pitch: %.3f | %.3f", pitch, targetPitch))
