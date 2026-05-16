@@ -42,7 +42,8 @@ SMOOTHING = 0.8
 local baseThrottle = 110
 local vxFiltered = 0    
 local vzFiltered = 0
-
+local ALIGN_VEL_TOLERANCE = 0.2     -- Max linear velocity (blocks/s) to be considered stable
+local ALIGN_ANG_TOLERANCE = 0.1     -- Max angular velocity (rad/s) to be considered stable
 
 print("Master ready")
 
@@ -184,8 +185,11 @@ local function flightThread()
     local targetYaw = 0 
 
     local wasManual = false
-
     local firstTick = true
+
+    -- NEW: Variables to track path alignment state
+    local alignState = false
+    local activePathKey = ""
 
     -- Constants (no altitude numbers!)
     local RECOVERY_JUMP_THROTTLE = 240
@@ -193,7 +197,7 @@ local function flightThread()
     local STUCK_TIME = 1.0        -- seconds before we declare "stuck"
     local JUMP_PULSE_TIME = 0.35  -- how long to fire jump throttle
 
-    -- State variables (add with your other locals)
+    -- State variables
     local recoveryTimer = 0
     local jumpPulseTimer = 0
     local wasRecovery = false
@@ -223,7 +227,7 @@ local function flightThread()
 
             if firstTick then   
                 if control.hasTarget and control.targetY then
-                    targetY = control.targetY   -- <<< ADD
+                    targetY = control.targetY   
                 else 
                     targetY = alt
                 end
@@ -264,11 +268,8 @@ local function flightThread()
             if control.manual then
                 wasManual = true
 
-                targetPitch =
-                    control.fb * 0.35
-
-                targetRoll =
-                    -control.rl * 0.35
+                targetPitch = control.fb * 0.35
+                targetRoll = -control.rl * 0.35
                 targetX = x
                 targetZ = z
             elseif vel.y < -2.0 then
@@ -282,6 +283,8 @@ local function flightThread()
                     velZPID.integral = 0; velZPID.lastError = 0
                     pathCrossPID.integral = 0; pathCrossPID.lastError = 0
                     pathAlongPID.integral = 0; pathAlongPID.lastError = 0
+                    
+                    activePathKey = "" -- Reset path state
                     wasManual = false
                 end
 
@@ -343,7 +346,7 @@ local function flightThread()
                     local distToB = math.sqrt(dxB*dxB + dzB*dzB)
                     local hVel = math.sqrt(vx*vx + vz*vz)
 
-                    -- Arrival tolerance: must be close AND slow
+                    -- Arrival tolerance
                     local ARRIVE_DIST = 1.0
                     local ARRIVE_VEL = 0.5
                     local isArrived = distToB < ARRIVE_DIST and hVel < ARRIVE_VEL
@@ -359,7 +362,7 @@ local function flightThread()
                     -- True geometric path direction (locked for entire segment)
                     local pathYaw = math.atan2(px, pz)
 
-                    -- Smoothly slew targetYaw toward pathYaw (3 rad/s max)
+                    -- Smoothly slew targetYaw toward pathYaw
                     local yawError = angleDiff(pathYaw, targetYaw)
                     local YAW_SLEW_RATE = 3.0
                     local maxYawStep = YAW_SLEW_RATE * dt
@@ -368,6 +371,38 @@ local function flightThread()
                     end
                     targetYaw = normalizeAngle(targetYaw + yawError)
 
+                    --------------------------------------------------
+                    -- ALIGNMENT CHECK
+                    --------------------------------------------------
+                    -- Identify if this is a new path we haven't aligned to yet
+                    local currentPathKey = tostring(Bx) .. "_" .. tostring(Bz) .. "_" .. tostring(control.targetY)
+                    if activePathKey ~= currentPathKey then
+                        alignState = true
+                        activePathKey = currentPathKey
+                    end
+
+                    -- Calculate real-world alignment errors
+                    local yawErrorActual = math.abs(angleDiff(pathYaw, yaw))
+                    local altErrorActual = math.abs(targetY - alt)
+
+                    -- Calculate velocity magnitudes to ensure mechanical stabilization
+                    -- (Using the filtered vx and vz you already computed above)
+                    local linearVelMag = math.sqrt(vx*vx + vy*vy + vz*vz)
+                    local angularVelMag = math.sqrt(pitchRate*pitchRate + yawRate*yawRate + rollRate*rollRate)
+
+                    -- Exit alignment state only when position, heading, drift, and rotation are stable
+                    if alignState 
+                    and yawErrorActual < 0.15 
+                    and altErrorActual < 1 
+                    and linearVelMag < ALIGN_VEL_TOLERANCE 
+                    and angularVelMag < ALIGN_ANG_TOLERANCE then
+                        
+                        alignState = false
+                    end
+
+                    --------------------------------------------------
+                    -- STATE MACHINE
+                    --------------------------------------------------
                     if isArrived then
                         -- --------------------------------------------------
                         -- ARRIVED: hold position at B using position PIDs
@@ -386,52 +421,64 @@ local function flightThread()
                         local targetVX = updatePID(posXPID, 0, -localDX, dt)
                         local targetVZ = updatePID(posZPID, 0, -localDZ, dt)
 
-                        -- Very tight limits when holding
                         local holdLimit = 0.5
                         targetVX = clamp(targetVX, -holdLimit, holdLimit)
                         targetVZ = clamp(targetVZ, -holdLimit, holdLimit)
 
-                        -- Deadzone to prevent creeping while holding
                         if math.abs(targetVX) < 0.2 then targetVX = 0 end
                         if math.abs(targetVZ) < 0.2 then targetVZ = 0 end
 
                         targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
                         targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
-                        -- targetYaw already updated above, maintain heading
 
+                    elseif alignState then
+                        -- --------------------------------------------------
+                        -- ALIGNING: hold at start point A until yaw/alt match
+                        -- --------------------------------------------------
+                        pathCrossPID.integral = 0; pathCrossPID.lastError = 0
+                        pathAlongPID.integral = 0; pathAlongPID.lastError = 0
+
+                        targetX = Ax
+                        targetZ = Az
+
+                        local pdx = targetX - x
+                        local pdz = targetZ - z
+                        local localDX = cosY * pdx - sinY * pdz
+                        local localDZ = sinY * pdx + cosY * pdz
+
+                        local targetVX = updatePID(posXPID, 0, -localDX, dt)
+                        local targetVZ = updatePID(posZPID, 0, -localDZ, dt)
+
+                        local holdLimit = 1.0
+                        targetVX = clamp(targetVX, -holdLimit, holdLimit)
+                        targetVZ = clamp(targetVZ, -holdLimit, holdLimit)
+
+                        if math.abs(targetVX) < 0.1 then targetVX = 0 end
+                        if math.abs(targetVZ) < 0.1 then targetVZ = 0 end
+
+                        targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
+                        targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
+                        
                     else
                         -- --------------------------------------------------
                         -- EN ROUTE: follow path with overshoot correction
                         -- --------------------------------------------------
-
-                        -- Along-track error: positive = before B, negative = overshoot
                         local errAlong = pathLen - proj
 
-                        -- If we overshot, reset forward PID state so accumulated
-                        -- bias doesn't fight the reverse command
                         if t > 1.0 and pathAlongPID.integral > 0 then
                             pathAlongPID.integral = 0
                         end
 
-                        -- Path-frame velocity commands
                         local vPathRight   = updatePID(pathCrossPID, 0, cross, dt)
                         local vPathForward = updatePID(pathAlongPID, 0, -errAlong, dt)
 
-                        -- Clamp to dynamic limits
                         vPathRight   = clamp(vPathRight, -velLimit, velLimit)
                         vPathForward = clamp(vPathForward, -velLimit, velLimit)
 
-                        -- Minimum-velocity deadzone: kill tiny commands that cause drift
                         local VEL_DEADZONE = 0.25
-                        if math.abs(vPathForward) < VEL_DEADZONE then
-                            vPathForward = 0
-                        end
-                        if math.abs(vPathRight) < VEL_DEADZONE then
-                            vPathRight = 0
-                        end
+                        if math.abs(vPathForward) < VEL_DEADZONE then vPathForward = 0 end
+                        if math.abs(vPathRight) < VEL_DEADZONE then vPathRight = 0 end
 
-                        -- Rotate path-frame velocity into drone-local frame
-                        -- Use true pathYaw (not slewed targetYaw) for velocity alignment
                         local yawDiff = yaw - pathYaw
                         local cDiff = math.cos(yawDiff)
                         local sDiff = math.sin(yawDiff)
@@ -441,7 +488,6 @@ local function flightThread()
 
                         targetPitch = clamp(updatePID(velZPID, targetVZ, localVZ, dt), -tiltLimit, tiltLimit)
                         targetRoll  = clamp(-updatePID(velXPID, targetVX, localVX, dt), -tiltLimit, tiltLimit)
-                        -- targetYaw already updated above
                     end
 
                 else
@@ -455,6 +501,8 @@ local function flightThread()
                             targetY = control.targetY
                         end
                     else
+                        activePathKey = "" -- reset path state memory
+                        
                         -- 5-block soft reset
                         local dx = targetX - x
                         local dz = targetZ - z
@@ -489,7 +537,6 @@ local function flightThread()
                     targetVX = clamp(targetVX, -velLimit, velLimit)
                     targetVZ = clamp(targetVZ, -velLimit, velLimit)
 
-                    -- Deadzone to prevent creeping in position hold
                     if math.abs(targetVX) < 0.2 then targetVX = 0 end
                     if math.abs(targetVZ) < 0.2 then targetVZ = 0 end
 
@@ -518,9 +565,6 @@ local function flightThread()
                     yawPID.integral = 0; yawPID.lastError = 0
                     yawRatePID.integral = 0; yawRatePID.lastError = 0
                 end
-
-                -- In auto path mode, targetYaw was already locked/slewed above.
-                -- In normal mode, targetYaw is whatever was set previously.
 
                 local yawError = angleDiff(targetYaw, yaw)
                 local YAW_DEADBAND = 0.03  -- ~1.7 degrees
@@ -558,15 +602,10 @@ local function flightThread()
             wasRecovery = recoveryMode
 
             -- STUCK LOGIC:
-            -- If inverted for > STUCK_TIME and vertical velocity is near zero,
-            -- we are physically blocked (ground, wall, or prop strike).
-            -- We IGNORE altitude entirely.
             local vyNearlyZero = math.abs(vy) < 0.8
             local isStuck = recoveryMode and (recoveryTimer > STUCK_TIME) and vyNearlyZero
 
             -- JUMP PULSE:
-            -- If stuck, we fire a short burst of max throttle to break contact.
-            -- Once jumpPulseTimer > 0, we keep jumping until it expires.
             if isStuck and jumpPulseTimer == 0 then
                 jumpPulseTimer = JUMP_PULSE_TIME  -- start jump
             end
@@ -583,11 +622,9 @@ local function flightThread()
             local multiplyer = 1.0
             local invert = 1.0
             if recoveryMode then
-                -- Reset targets so we don't fly sideways while tumbling
                 targetX = x
                 targetZ = z
 
-                -- Kill ALL integral windup while recovering
                 altPID.integral = 0; altPID.lastError = 0
                 velPID.integral = 0; velPID.lastError = 0
                 posXPID.integral = 0; posXPID.lastError = 0
@@ -596,21 +633,13 @@ local function flightThread()
                 velZPID.integral = 0; velZPID.lastError = 0
 
                 if isJumping then
-                    -- JUMP PHASE: Break ground contact with raw power.
-                    -- Physics constraints disappear once we leave the ground.
                     throttle = RECOVERY_JUMP_THROTTLE
-                    
-                    -- Dampen all attitude corrections during jump.
-                    -- We want LIFT, not torque, while touching the ground.
                     multiplyer = 0.05
                     invert = -1.0
                 else
-                    -- FLIP PHASE: Either airborne-inverted, or post-jump.
-                    -- Moderate throttle gives rotational authority without rocketing away.
                     throttle = RECOVERY_AIR_THROTTLE
                 end
             else
-                -- NORMAL FLIGHT (your existing logic)
                 local tiltFactor = 1.0 / math.max(0.5, upVector)
                 local yawCompensation = math.abs(yawRate) * 2.5
                 throttle = math.max(30, math.min((baseThrottle + yCorr) * tiltFactor - yawCompensation, 250))
@@ -633,7 +662,6 @@ local function flightThread()
             local sumOffset = 0
 
             for i, motor in ipairs(motors) do
-                -- Calculate only the PIDs contribution (offset from throttle)
                 local offset = - pitchCorr * motor.z
                                - rollCorr  * motor.x
                                - yawCorr   * motor.spin
@@ -642,28 +670,17 @@ local function flightThread()
                 sumOffset = sumOffset + offset
             end
 
-            -- Calculate how much the 'average' motor speed changed
-            -- This helps prevent the "climb on yaw" effect
             local avgOffset = sumOffset / #motors
             
             for i=1, #rawSpeeds do
-                -- Add the requested throttle, but subtract the bias added by PIDs
                 rawSpeeds[i] = throttle + rawSpeeds[i] - avgOffset
                 
                 if rawSpeeds[i] < minSpeed then minSpeed = rawSpeeds[i] end
                 if rawSpeeds[i] > maxSpeed then maxSpeed = rawSpeeds[i] end
             end
 
-            -- Air Mode / Saturation Prevention
-            -- local boost = 0
-            -- if minSpeed < 15 then
-            --     boost = 15 - minSpeed
-            -- elseif maxSpeed > 255 then
-            --     boost = 255 - maxSpeed -- This will be a negative number (reduction)
-            -- end
-
             for i, motor in ipairs(motors) do
-                local finalSpeed = clampInt(invert *    rawSpeeds[i], -255, 255)
+                local finalSpeed = clampInt(invert * rawSpeeds[i], -255, 255)
                 
                 rednet.send(
                     motor.id,
@@ -679,7 +696,7 @@ local function flightThread()
             term.setCursorPos(1,1)
 
             print("=== DRONE STATE ===")
-            print(string.format("dt: %.4f freq: %0.4f ver: 1.3", dt, 1.0/dt))
+            print(string.format("dt: %.4f freq: %0.4f ver: 1.4", dt, 1.0/dt))
 
             print("\n-- Orientation (radians) --")
             print(string.format("Pitch: %.3f | %.3f", pitch, targetPitch))
@@ -714,8 +731,9 @@ local function flightThread()
             ))
 
             print(string.format(
-                "Manual  : %s",
-                tostring(control.manual)
+                "Manual  : %s | Aligning %s",
+                tostring(control.manual),
+                tostring(alignState)
             ))
 
             sleep(0.02)
