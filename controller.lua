@@ -10,8 +10,8 @@ for _, side in ipairs(peripheral.getNames()) do
     end
 end
 
-local redstonelink = peripheral.find("redstone_link_bridge")  
-assert(redstonelink, "No redstone_link_bridge found")  
+local redstonelink = peripheral.find("redstone_link_bridge")
+assert(redstonelink, "No redstone_link_bridge found")
 
 --------------------------------------------------
 -- Config
@@ -21,7 +21,7 @@ if not fs.exists("controller.txt") then
     error("Run controllerSetup.lua first")
 end
 
-local file = fs.open("controller.txt","r")
+local file = fs.open("controller.txt", "r")
 local config = textutils.unserialize(file.readAll())
 file.close()
 
@@ -35,7 +35,7 @@ local CHANNEL = config.channel
 local waypoints = {}
 local autoMode = false
 local autoIndex = 1
-local autoState = "idle"   -- "idle", "moving", "waiting", "paused"
+local autoState = "idle" -- "idle", "moving", "waiting", "paused"
 local autoWaitTimer = 0
 local manualPauseTimer = 0
 local lastManual = false
@@ -52,6 +52,8 @@ local WAYPOINT_ARRIVE_VEL = 0.5
 local WAYPOINT_ARRIVE_ALT = 1.5
 local WAYPOINT_ARRIVE_YAW = 0.15
 local ARRIVE_SUSTAIN = 0.5
+local smoothTargetY = nil
+local smoothTargetYaw = nil
 
 local function loadWaypoints()
     if not fs.exists("waypoints.txt") then return false end
@@ -71,9 +73,9 @@ local function loadWaypoints()
 
                 if wx and wz and wy then
                     table.insert(waypoints, {
-                        x = wx, 
-                        z = wz, 
-                        y = wy, 
+                        x = wx,
+                        z = wz,
+                        y = wy,
                         yaw = wyaw,
                         altChange = waltChange
                     })
@@ -128,7 +130,7 @@ local lastSent = nil
 local lastHeartbeat = 0
 local txCount = 0
 local rxCount = 0
-local lastRaw = { f=0, b=0, r=0, l=0, u=0, d=0, yr=0, yl=0 }
+local lastRaw = { f = 0, b = 0, r = 0, l = 0, u = 0, d = 0, yr = 0, yl = 0 }
 local prevX, prevZ
 
 --------------------------------------------------
@@ -178,6 +180,23 @@ local function changed(a, b)
         math.abs(a.th - b.th) > 0.01
 end
 
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+local function approach(current, target, maxStep)
+    local diff = target - current
+
+    if math.abs(diff) <= maxStep then
+        return target
+    end
+
+    if diff > 0 then
+        return current + maxStep
+    else
+        return current - maxStep
+    end
+end
 --------------------------------------------------
 -- Read Raw Input
 --------------------------------------------------
@@ -196,10 +215,10 @@ local function getRawInput()
     lastRaw.u = u; lastRaw.d = d; lastRaw.yr = yr; lastRaw.yl = yl
 
     return {
-        fb = norm(f)  - norm(b),
-        rl = norm(r)  - norm(l),
+        fb = norm(f) - norm(b),
+        rl = norm(r) - norm(l),
         yc = norm(yr) - norm(yl),
-        th = norm(u)  - norm(d)
+        th = norm(u) - norm(d)
     }
 end
 
@@ -265,9 +284,13 @@ local function drawDebugUI(raw, input, hasTarget, targetX, targetZ, targetY, now
     local conn = "NO CONN"
     if droneTelemetry then
         local age = now - lastTelemetryTime
-        if age < 1.0 then conn = "CONN OK"
-        elseif age < 3.0 then conn = "SLOW"
-        else conn = "STALE" end
+        if age < 1.0 then
+            conn = "CONN OK"
+        elseif age < 3.0 then
+            conn = "SLOW"
+        else
+            conn = "STALE"
+        end
     end
     local title = "=== DRONE CONTROLLER ==="
     term.write(title .. string.rep(" ", w - #title - #conn - 2) .. "[" .. conn .. "]")
@@ -286,13 +309,18 @@ local function drawDebugUI(raw, input, hasTarget, targetX, targetZ, targetY, now
     local y = 3
 
     term.setCursorPos(1, y); term.write("-- INPUTS --"); y = y + 1
-    term.setCursorPos(1, y); term.write(string.format("FB  raw:%+5.2f (%2d|%2d)", raw.fb, lastRaw.f, lastRaw.b)); y = y + 1
-    term.setCursorPos(1, y); term.write(string.format("    out:%+5.2f  man:%s", input.fb, tostring(input.manual))); y = y + 1
-    term.setCursorPos(1, y); term.write(string.format("RL  raw:%+5.2f (%2d|%2d)", raw.rl, lastRaw.r, lastRaw.l)); y = y + 1
+    term.setCursorPos(1, y); term.write(string.format("FB  raw:%+5.2f (%2d|%2d)", raw.fb, lastRaw.f, lastRaw.b)); y = y +
+    1
+    term.setCursorPos(1, y); term.write(string.format("    out:%+5.2f  man:%s", input.fb, tostring(input.manual))); y = y +
+    1
+    term.setCursorPos(1, y); term.write(string.format("RL  raw:%+5.2f (%2d|%2d)", raw.rl, lastRaw.r, lastRaw.l)); y = y +
+    1
     term.setCursorPos(1, y); term.write(string.format("    out:%+5.2f", input.rl)); y = y + 1
-    term.setCursorPos(1, y); term.write(string.format("YC  raw:%+5.2f (%2d|%2d)", raw.yc, lastRaw.yr, lastRaw.yl)); y = y + 1
+    term.setCursorPos(1, y); term.write(string.format("YC  raw:%+5.2f (%2d|%2d)", raw.yc, lastRaw.yr, lastRaw.yl)); y = y +
+    1
     term.setCursorPos(1, y); term.write(string.format("    out:%+5.2f", input.yc)); y = y + 1
-    term.setCursorPos(1, y); term.write(string.format("TH  raw:%+5.2f (%2d|%2d)", raw.th, lastRaw.u, lastRaw.d)); y = y + 1
+    term.setCursorPos(1, y); term.write(string.format("TH  raw:%+5.2f (%2d|%2d)", raw.th, lastRaw.u, lastRaw.d)); y = y +
+    1
     term.setCursorPos(1, y); term.write(string.format("    out:%+5.2f", input.th)); y = y + 1
 
     y = y + 1
@@ -312,11 +340,14 @@ local function drawDebugUI(raw, input, hasTarget, targetX, targetZ, targetY, now
 
     term.setCursorPos(col + 2, y); term.write("-- DRONE TELEMETRY --"); y = y + 1
     if droneTelemetry then
-        term.setCursorPos(col + 2, y); term.write(string.format("POS:  %6.1f  %6.1f", droneTelemetry.x, droneTelemetry.z)); y = y + 1
+        term.setCursorPos(col + 2, y); term.write(string.format("POS:  %6.1f  %6.1f", droneTelemetry.x, droneTelemetry.z)); y =
+        y + 1
         term.setCursorPos(col + 2, y); term.write(string.format("ALT:  %6.1f", droneTelemetry.y)); y = y + 1
-        term.setCursorPos(col + 2, y); term.write(string.format("VEL:  %5.1f %5.1f %5.1f", droneTelemetry.vx, droneTelemetry.vy, droneTelemetry.vz)); y = y + 1
+        term.setCursorPos(col + 2, y); term.write(string.format("VEL:  %5.1f %5.1f %5.1f", droneTelemetry.vx,
+            droneTelemetry.vy, droneTelemetry.vz)); y = y + 1
         term.setCursorPos(col + 2, y); term.write(string.format("YAW:  %6.3f", droneTelemetry.yaw)); y = y + 1
-        term.setCursorPos(col + 2, y); term.write(string.format("PITCH:%6.3f  ROLL:%6.3f", droneTelemetry.pitch, droneTelemetry.roll)); y = y + 1
+        term.setCursorPos(col + 2, y); term.write(string.format("PITCH:%6.3f  ROLL:%6.3f", droneTelemetry.pitch,
+            droneTelemetry.roll)); y = y + 1
         term.setCursorPos(col + 2, y); term.write(string.format("AGE:  %.2fs", now - lastTelemetryTime)); y = y + 1
     else
         term.setCursorPos(col + 2, y); term.write("NO TELEMETRY"); y = y + 1
@@ -329,19 +360,21 @@ local function drawDebugUI(raw, input, hasTarget, targetX, targetZ, targetY, now
         term.setCursorPos(col + 2, y); term.write(string.format("WP:   %d / %d", autoIndex, #waypoints)); y = y + 1
         if waypoints[autoIndex] then
             local wp = waypoints[autoIndex]
-            term.setCursorPos(col + 2, y); term.write(string.format("CUR:  %.1f, %.1f, %.1f", wp.x, wp.z, wp.y)); y = y + 1
+            term.setCursorPos(col + 2, y); term.write(string.format("CUR:  %.1f, %.1f, %.1f", wp.x, wp.z, wp.y)); y = y +
+            1
             term.setCursorPos(col + 2, y); term.write(string.format("YAW:  %.2f rad", wp.yaw)); y = y + 1
             if droneTelemetry and autoState == "moving" then
                 local dx = wp.x - droneTelemetry.x
                 local dz = wp.z - droneTelemetry.z
-                local dist = math.sqrt(dx*dx + dz*dz)
+                local dist = math.sqrt(dx * dx + dz * dz)
                 term.setCursorPos(col + 2, y); term.write(string.format("DIST: %.2f", dist)); y = y + 1
             end
         end
         if autoState == "waiting" then
             term.setCursorPos(col + 2, y); term.write(string.format("WAIT: %.1f s", autoWaitTimer)); y = y + 1
         elseif autoState == "moving" then
-            term.setCursorPos(col + 2, y); term.write(string.format("ARR:  %.2f / %.1f", arriveTimer, ARRIVE_SUSTAIN)); y = y + 1
+            term.setCursorPos(col + 2, y); term.write(string.format("ARR:  %.2f / %.1f", arriveTimer, ARRIVE_SUSTAIN)); y =
+            y + 1
         end
     else
         term.setCursorPos(col + 2, y); term.write("NO WAYPOINTS"); y = y + 1
@@ -360,12 +393,12 @@ end
 
 local function txThread()
     local lastTime = os.clock()
-    
+
     while true do
         local raw = getRawInput()
         local input = processInput(raw)
         local now = os.clock()
-        
+
         local dt = now - lastTime
         if dt <= 0 then dt = 0.001 end
         lastTime = now
@@ -395,7 +428,7 @@ local function txThread()
             autoState = "moving"
         end
 
-local wp = waypoints[autoIndex]
+        local wp = waypoints[autoIndex]
 
         if autoMode and not manualActive and wp then
             hasTarget = true
@@ -407,9 +440,19 @@ local wp = waypoints[autoIndex]
             if autoState == "waiting" then
                 currentTrackedY = wp.y + wp.altChange
             end
-            
+
             -- Apply it to the outgoing packet target
-            targetY = currentTrackedY
+            if not smoothTargetY then
+                smoothTargetY = currentTrackedY
+            end
+
+            smoothTargetY = approach(
+                smoothTargetY,
+                currentTrackedY,
+                dt * 1.5
+            )
+
+            targetY = smoothTargetY
 
             if autoState == "moving" then
                 if autoIndex ~= lastAutoIndex then
@@ -431,14 +474,20 @@ local wp = waypoints[autoIndex]
                 if droneTelemetry then
                     local dx = wp.x - droneTelemetry.x
                     local dz = wp.z - droneTelemetry.z
-                    local dist = math.sqrt(dx*dx + dz*dz)
-                    local hVel = math.sqrt(droneTelemetry.vx^2 + droneTelemetry.vz^2)
-                    
+                    local dist = math.sqrt(dx * dx + dz * dz)
+                    local hVel = math.sqrt(droneTelemetry.vx ^ 2 + droneTelemetry.vz ^ 2)
+
                     -- FIX: Calculate altErr using the correctly tracked target value!
                     local altErr = math.abs(currentTrackedY - droneTelemetry.y)
 
-                    if dist < WAYPOINT_ARRIVE_DIST then
-                        useTargetYaw = true 
+                    local totalVel = math.sqrt(
+                        droneTelemetry.vx^2 +
+                        droneTelemetry.vy^2 +
+                        droneTelemetry.vz^2
+                    )
+
+                    if dist < WAYPOINT_ARRIVE_DIST and totalVel < 0.8 then
+                        useTargetYaw = true
                         local yawErr = math.abs(angleDiff(wp.yaw, droneTelemetry.yaw))
 
                         -- If position, flight velocity, active altitude, and yaw match up:
@@ -457,7 +506,6 @@ local wp = waypoints[autoIndex]
                         arriveTimer = 0
                     end
                 end
-
             elseif autoState == "waiting" then
                 useTargetYaw = true -- Lock heading to waypoint's targeted angle
                 -- targetY is already set to wp.y + wp.altChange up above via currentTrackedY!
@@ -480,8 +528,8 @@ local wp = waypoints[autoIndex]
                 if droneTelemetry then
                     local dx = wp.x - droneTelemetry.x
                     local dz = wp.z - droneTelemetry.z
-                    local dist = math.sqrt(dx*dx + dz*dz)
-                    local hVel = math.sqrt(droneTelemetry.vx^2 + droneTelemetry.vz^2)
+                    local dist = math.sqrt(dx * dx + dz * dz)
+                    local hVel = math.sqrt(droneTelemetry.vx ^ 2 + droneTelemetry.vz ^ 2)
                     local altErr = math.abs(currentTrackedY - droneTelemetry.y)
                     local yawErr = math.abs(angleDiff(wp.yaw, droneTelemetry.yaw))
 
@@ -519,13 +567,22 @@ local wp = waypoints[autoIndex]
             hasTarget = hasTarget,
             timestamp = now
         }
+        if not smoothTargetYaw then
+            smoothTargetYaw = droneTelemetry and droneTelemetry.yaw or wp.yaw
+        end
+
+        local yawError = angleDiff(wp.yaw, smoothTargetYaw)
+
+        smoothTargetYaw =
+            smoothTargetYaw +
+            clamp(yawError, -dt * 1.2, dt * 1.2)
         if hasTarget then
             packet.targetX = targetX
             packet.targetZ = targetZ
-            packet.targetY = targetY   
+            packet.targetY = targetY
             packet.prevX = prevX
             packet.prevZ = prevZ
-            packet.targetYaw = wp.yaw          -- Transmit targeted orientation
+            packet.targetYaw = smoothTargetYaw -- Transmit targeted orientation
             packet.useTargetYaw = useTargetYaw -- Flag telling flight computer whether to execute path vs target yaw
         end
 
