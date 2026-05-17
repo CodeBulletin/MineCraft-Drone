@@ -1,72 +1,63 @@
 term.clear()
 term.setCursorPos(1,1)
 
-print("=== MOTOR CALIBRATION ===")
+-- Open modem
+for _, side in ipairs(peripheral.getNames()) do
+    if peripheral.getType(side) == "modem" then
+        rednet.open(side)
+        print("Opened modem on " .. side)
+        break
+    end
+end
 
-write("Network Name: ")
-local network = read()
+print("\nWaiting for Master to assign role...")
 
-print("")
-print("Coordinate System:")
-print("+X = RIGHT")
-print("-X = LEFT")
-print("+Z = FRONT")
-print("-Z = REAR")
-print("")
-
-write("Offset X: ")
-local offsetX = tonumber(read())
-
-write("Offset Z: ")
-local offsetZ = tonumber(read())
-
-print("")
-print("Spin Direction:")
-print("1  = CW")
-print("-1 = CCW")
-
-write("Spin Dir: ")
-local spinDir = tonumber(read())
-
-local file = fs.open("motor.txt","w")
-
-file.write(textutils.serialize({
-    network = network,
-    offsetX = offsetX,
-    offsetZ = offsetZ,
-    spinDir = spinDir
-}))
-
-file.close()
-
-print("")
-print("Saved!")
-
---------------------------------------------------
--- setup registration
---------------------------------------------------
-
-print("")
-print("Waiting for setup...")
+-- Start a timer to repeatedly ping the master until it answers
+local pingTimer = os.startTimer(1)
 
 while true do
+    local event, p1, p2, p3 = os.pullEvent()
 
-    local senderId, message, protocol =
-        rednet.receive("setup")
+    --------------------------------------------------
+    -- Broadcast readiness
+    --------------------------------------------------
+    if event == "timer" and p1 == pingTimer then
+        rednet.broadcast({ type = "motor_ready" }, "setup_sys")
+        pingTimer = os.startTimer(1)
+    end
 
-    if type(message) == "table"
-    and message.type == "setup_request"
-    and message.network == network then
+    --------------------------------------------------
+    -- Receive Assignment
+    --------------------------------------------------
+    if event == "rednet_message" then
+        local senderId = p1
+        local message = p2
+        local protocol = p3
 
-        rednet.send(senderId,{
-            type = "register",
-            network = network,
-            offsetX = offsetX,
-            offsetZ = offsetZ,
-            spinDir = spinDir
-        },"setup")
+        if protocol == "setup_sys" 
+        and type(message) == "table" 
+        and message.type == "assign_config" then
+            
+            -- Save the injected configuration
+            local file = fs.open("motor.txt", "w")
+            file.write(textutils.serialize({
+                network = message.network,
+                offsetX = message.offsetX,
+                offsetZ = message.offsetZ,
+                spinDir = message.spinDir
+            }))
+            file.close()
 
-        print("Registered")
-        break
+            -- Confirm receipt back to master
+            rednet.send(senderId, { type = "motor_confirmed" }, "setup_sys")
+
+            print("\n=== ROLE ASSIGNED ===")
+            print("Network: " .. message.network)
+            print("X Offset: " .. message.offsetX)
+            print("Z Offset: " .. message.offsetZ)
+            print("Spin Dir: " .. message.spinDir)
+            print("\nMotor Setup Complete.")
+            break
+        end
     end
 end
